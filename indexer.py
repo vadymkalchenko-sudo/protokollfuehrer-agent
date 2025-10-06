@@ -1,7 +1,7 @@
 import os
 import logging
+import json
 from dotenv import load_dotenv
-from supabase import create_client, Client
 import google.generativeai as genai
 from pgvector.psycopg2 import register_vector
 import psycopg2
@@ -15,44 +15,31 @@ logging.basicConfig(level=logging.INFO,
 load_dotenv()
 
 # --- Environment Variable Loading ---
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # --- Validation ---
-if not all([SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY]):
-    logging.error("Missing one or more required environment variables (SUPABASE_URL, SUPABASE_KEY, GEMINI_API_KEY).")
+if not all([DB_CONNECTION_URI, GEMINI_API_KEY]):
+    logging.error("Missing one or more required environment variables (DB_CONNECTION_URI, GEMINI_API_KEY).")
     exit(1)
 
 # --- Client Initialization ---
+conn = None
 try:
-    # Initialize Supabase client
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logging.info("Successfully connected to Supabase.")
-
     # Configure Gemini API
     genai.configure(api_key=GEMINI_API_KEY)
     logging.info("Gemini API configured.")
 
-    # Connect to PostgreSQL for pgvector
-    # Supabase uses postgresql://postgres:[YOUR-PASSWORD]@[AWS-REGION].pooler.supabase.com:6543/postgres
-    # We need to construct the DSN from the Supabase URL and Key (which often acts as the password for db access)
-    db_url_parts = SUPABASE_URL.replace("https://", "").replace(".supabase.co", "").split('@')
-    db_host_port = db_url_parts[0].split('.')
-    db_host = f"{db_host_port[1]}.pooler.supabase.com"
-    db_name = "postgres"
-    db_user = "postgres"
-    db_password = SUPABASE_KEY # Common practice for Supabase direct connections
-
-    # Correct f-string usage, avoiding backslash issues.
-    # The DSN format is standard and doesn't contain problematic backslashes.
-    dsn = f"postgresql://{db_user}:{db_password}@{db_host}:6543/{db_name}"
-    conn = psycopg2.connect(dsn)
-    logging.info("Successfully connected to the database for pgvector registration.")
+    # Connect to PostgreSQL using the direct Transaction Pooler URI
+    logging.info("Connecting to the database via Transaction Pooler...")
+    conn = psycopg2.connect(DB_CONNECTION_URI)
     register_vector(conn)
+    logging.info("Successfully connected to the database and registered pgvector.")
 
 except Exception as e:
-    logging.error(f"Failed to initialize clients: {e}")
+    logging.error(f"Failed to initialize clients or connect to the database: {e}")
+    if conn:
+        conn.close()
     exit(1)
 
 
@@ -68,25 +55,32 @@ def get_embedding(text: str, model: str = "models/embedding-001") -> list[float]
         logging.error(f"Failed to generate embedding: {e}")
         return []
 
-def store_protocol(text: str, embedding: list[float], metadata: dict) -> None:
+def store_protocol(conn, text: str, embedding: list[float], metadata: dict) -> None:
     """
-    Stores the protocol text, its embedding, and metadata in the Supabase 'protokolle' table.
+    Stores the protocol text, its embedding, and metadata in the 'protokolle' table using psycopg2.
     """
     if not embedding:
         logging.warning("Skipping storage due to empty embedding.")
         return
 
+    # Convert metadata dict to a JSON string for the JSONB column
+    metadata_json = json.dumps(metadata)
+
     try:
         logging.info(f"Storing protocol with metadata: {metadata}")
-        data, count = supabase.table('protokolle').insert({
-            'text': text,
-            'embedding': embedding,
-            'metadata': metadata
-        }).execute()
-        logging.info(f"Successfully stored protocol. Response: {data}")
+        # Use a `with` statement for the cursor to ensure it's closed automatically
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO protokolle (text, embedding, metadata) VALUES (%s, %s, %s)",
+                (text, embedding, metadata_json)
+            )
+        # Commit the transaction to make the changes permanent
+        conn.commit()
+        logging.info(f"Successfully stored protocol for meeting_id: {metadata.get('meeting_id')}")
     except Exception as e:
-        # Log the detailed error from the database if possible
         logging.error(f"Failed to store protocol. Error: {e}")
+        # Rollback the transaction in case of an error
+        conn.rollback()
 
 
 def main():
@@ -120,7 +114,7 @@ def main():
 
         # 2. Store in Supabase
         if embedding:
-            store_protocol(protocol_text, embedding, protocol_metadata)
+            store_protocol(conn, protocol_text, embedding, protocol_metadata)
         else:
             logging.warning(f"Could not process protocol {protocol_metadata['meeting_id']} due to embedding failure.")
 
