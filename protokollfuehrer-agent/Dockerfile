@@ -10,8 +10,5 @@ COPY requirements.txt .
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the content of the local src directory to the working directory
-COPY . .
-
 # Specify the command to run on container startup
 CMD ["python", "protokoll_bridge.py"]
