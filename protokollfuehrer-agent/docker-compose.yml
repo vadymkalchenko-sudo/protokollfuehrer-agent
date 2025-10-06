@@ -1,0 +1,9 @@
+version: '3.8'
+services:
+  protokoll-agent:
+    build: .
+    container_name: protokoll-agent
+    env_file:
+      - .env
+    volumes:
+      - .:/app
