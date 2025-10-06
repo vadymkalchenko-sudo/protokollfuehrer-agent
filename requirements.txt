@@ -1,4 +1,0 @@
-python-dotenv
-google-generativeai
-supabase
-psycopg2-binary
