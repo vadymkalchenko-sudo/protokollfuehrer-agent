@@ -4,6 +4,7 @@ import sys
 import json
 import time # Für die Wartefunktion
 import hashlib
+from typing import Optional
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pgvector.psycopg2 import register_vector
@@ -115,28 +116,7 @@ def get_embedding(text: str, model: str = "text-embedding-004") -> list[float]:
             
     return [] 
 
-def load_protocol_data(filepath: str) -> dict | None:
-    """Lädt Protokolldaten aus einer Datei und erstellt Metadaten."""
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            text = f.read()
-
-        filename = os.path.basename(filepath)
-        # Simple Metadaten-Extraktion aus dem Dateinamen
-        meeting_id = os.path.splitext(filename)[0]
-
-        return {
-            "text": text,
-            "metadata": {
-                "source_file": filepath,
-                "meeting_id": meeting_id
-            }
-        }
-    except Exception as e:
-        logging.error(f"Fehler beim Laden der Protokolldatei {filepath}: {e}")
-        return None
-
-def load_protocol_data(filepath: str) -> dict | None:
+def load_protocol_data(filepath: str) -> Optional[dict]:
     """Lädt Protokolldaten aus einer Datei und erstellt Metadaten."""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -153,7 +133,7 @@ def load_protocol_data(filepath: str) -> dict | None:
         logging.error(f"Fehler beim Laden der Protokolldatei {filepath}: {e}")
         return None
 
-def get_stored_hash(conn, source_file: str) -> str | None:
+def get_stored_hash(conn, source_file: str) -> Optional[str]:
     """Holt den gespeicherten content_hash für eine bestimmte source_file."""
     try:
         with conn.cursor() as cur:
