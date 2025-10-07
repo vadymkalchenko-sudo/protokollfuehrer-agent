@@ -106,6 +106,25 @@ def get_embedding(text: str, model: str = "text-embedding-004") -> list[float]:
             
     return [] 
 
+def is_already_indexed(conn, source_file: str) -> bool:
+    """
+    Prüft, ob ein Protokoll mit dem gegebenen Dateinamen bereits in der DB indiziert ist.
+    """
+    try:
+        with conn.cursor() as cur:
+            # Effiziente Abfrage, die prüft, ob der 'source_file' Key im JSONB-Feld existiert und dem Wert entspricht.
+            cur.execute(
+                "SELECT 1 FROM protokolle WHERE metadata->>'source_file' = %s LIMIT 1",
+                (source_file,)
+            )
+            # fetchone() gibt ein Tupel zurück, wenn ein Datensatz gefunden wird, sonst None.
+            return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"🚨 FEHLER bei der Duplikatsprüfung für '{source_file}': {e}")
+        # Im Fehlerfall gehen wir vorsichtshalber davon aus, dass es nicht indiziert ist,
+        # um Datenverlust zu vermeiden, aber loggen den Fehler deutlich.
+        return False
+
 def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: dict) -> None:
     """
     Speichert Protokolltext, Embedding und Metadaten in der 'protokolle' Tabelle.
@@ -144,25 +163,41 @@ def main():
     # Initialisiert Clients und bricht bei Fehler ab
     conn = initialize_clients()
     
-    # Beispiel-Daten
+    # Beispiel-Daten (angepasst, um 'source_file' zu enthalten)
+    # In einer echten Implementierung würde dies aus dem Dateisystem geladen.
     meeting_protocols = [
         {
             "text": "Meeting 1: Q3 Planning. Topics discussed: budget allocation, resource management, and setting new KPIs for the marketing team. Action items assigned to John and Maria.",
-            "metadata": {"date": "2024-07-15", "meeting_id": "M1", "department": "Marketing"}
+            "metadata": {"date": "2024-07-15", "meeting_id": "M1", "department": "Marketing", "source_file": "protocols/meeting_q3_planning.txt"}
         },
         {
             "text": "Meeting 2: Technical Sprint Review. The engineering team presented the new features for the mobile app. A bug was identified in the payment gateway integration. The bug was assigned to the backend team.",
-            "metadata": {"date": "2024-07-16", "meeting_id": "M2", "department": "Engineering"}
+            "metadata": {"date": "2024-07-16", "meeting_id": "M2", "department": "Engineering", "source_file": "protocols/sprint_review_tech.md"}
         },
         {
             "text": "Meeting 3: All-Hands Update. CEO shared the company's performance for H1 2024. New strategic partnerships were announced. An open Q&A session was held.",
-            "metadata": {"date": "2024-07-18", "meeting_id": "M3", "department": "All"}
+            "metadata": {"date": "2024-07-18", "meeting_id": "M3", "department": "All", "source_file": "protocols/all_hands_h1_2024.txt"}
         }
     ]
 
     for protocol in meeting_protocols:
+        # Extrahiere den Dateinamen für die Duplikatsprüfung
+        source_file = protocol["metadata"].get("source_file")
+
+        if not source_file:
+            logging.warning(f"Skipping protocol due to missing 'source_file' in metadata: {protocol['metadata']}")
+            continue
+
+        # Prüfen, ob die Datei bereits indiziert wurde
+        if is_already_indexed(conn, source_file):
+            logging.info(f"Skipping {source_file}: Already indexed.")
+            continue # Nächste Datei verarbeiten
+
+        # Nur wenn nicht bereits indiziert, Embedding holen und speichern
+        logging.info(f"Processing new file: {source_file}")
         embedding = get_embedding(protocol["text"]) 
         store_protocol(conn, protocol["text"], embedding, protocol["metadata"])
+
         # Wartezeit von 2 Sekunden zwischen den API-Aufrufen, um Free-Tier-Limits zu respektieren.
         time.sleep(2) 
 
