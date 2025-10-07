@@ -10,8 +10,9 @@ services:
     # Mountet den lokalen Code in den Container
     volumes:
       - .:/app
-    # Startet das korrigierte Indexing-Skript
-    command: python indexer.py
+    # Stellt sicher, dass der PYTHONPATH beim Start gesetzt wird,
+    # um die im Dockerfile isolierten Abhängigkeiten zu finden.
+    command: /bin/bash -c "PYTHONPATH=$$PYTHON_DEPENDENCIES_PATH python indexer.py"
     
   query-agent:
     build: .
@@ -20,4 +21,6 @@ services:
       - .env
     volumes:
       - .:/app
-    command: python query_agent.py
+    # Stellt sicher, dass der PYTHONPATH beim Start gesetzt wird,
+    # um die im Dockerfile isolierten Abhängigkeiten zu finden.
+    command: /bin/bash -c "PYTHONPATH=$$PYTHON_DEPENDENCIES_PATH python query_agent.py"
