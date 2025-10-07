@@ -12,3 +12,12 @@ services:
       - .:/app
     # Startet das korrigierte Indexing-Skript
     command: python indexer.py
+    
+  query-agent:
+    build: .
+    container_name: protokollfuehrer-query-agent
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python query_agent.py
