@@ -1,6 +1,14 @@
 version: '3.8'
+
 services:
   indexer:
+    # Baut das Image basierend auf dem Dockerfile
     build: .
+    # Lädt die Umgebungsvariablen aus der .env-Datei
     env_file:
       - .env
+    # Mountet den lokalen Code in den Container
+    volumes:
+      - .:/app
+    # Startet das korrigierte Indexing-Skript
+    command: python indexer.py

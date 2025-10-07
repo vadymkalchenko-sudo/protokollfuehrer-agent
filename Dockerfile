@@ -1,20 +1,26 @@
-# Use a more stable Python runtime as a parent image that includes build tools
-FROM python:3.9-buster
+# Verwende ein stabileres und aktuelleres Debian-Basis-Image (Bullseye)
+# Statt des veralteten 'buster', um 404-Fehler bei apt-get zu vermeiden.
+FROM python:3.9-slim-bullseye
 
-# Set the working directory in the container
+# Setze das Arbeitsverzeichnis im Container
 WORKDIR /app
 
-# Install PostgreSQL client development files needed for psycopg2
+# Installiere PostgreSQL client development files needed for psycopg2
+# Aktualisiert die Repositories und installiert libpq-dev
 RUN apt-get update && apt-get install -y libpq-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy the dependencies file to the working directory
+# Kopiere die Abhängigkeitsdatei in das Arbeitsverzeichnis
 COPY requirements.txt .
 
-# Install any needed dependencies specified in requirements.txt
+# Installiere Python-Abhängigkeiten
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application's code
+# Kopiere den gesamten Anwendungscode in den Container
 COPY . .
 
-# Run indexer.py when the container launches
-CMD ["python", "indexer.py"]
+# Setze Umgebungsvariablen für die Anwendung (nicht kritisch, aber gute Praxis)
+ENV PYTHONUNBUFFERED 1
+
+# Das Entrypoint-Skript wird von docker-compose überschrieben, 
+# aber wir definieren einen Standard.
+CMD ["python", "protokoll_agent.py"]

@@ -1,10 +1,14 @@
 import os
 import logging
+import sys
 import json
+import time # Für die Wartefunktion
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pgvector.psycopg2 import register_vector
 import psycopg2
+from psycopg2 import sql 
+from urllib.parse import urlparse 
 
 # --- Configuration ---
 # Configure logging
@@ -15,81 +19,132 @@ logging.basicConfig(level=logging.INFO,
 load_dotenv()
 
 # --- Environment Variable Loading ---
-DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 
-# --- Validation ---
-if not all([DB_CONNECTION_URI, GEMINI_API_KEY]):
-    logging.error("Missing one or more required environment variables (DB_CONNECTION_URI, GEMINI_API_KEY).")
-    exit(1)
-
-# --- Client Initialization ---
+# --- Globale Initialisierung und Verbindung ---
 conn = None
-try:
-    # Configure Gemini API
-    genai.configure(api_key=GEMINI_API_KEY)
-    logging.info("Gemini API configured.")
+# NEUER FIX: Verwendet den realistischeren Supabase Dateinamen, der oft heruntergeladen wird.
+SUPABASE_CERT_PATH = os.path.join(os.path.dirname(__file__), 'prod-ca-2021.crt')
 
-    # Connect to PostgreSQL using the direct Transaction Pooler URI
-    logging.info("Connecting to the database via Transaction Pooler...")
-    conn = psycopg2.connect(DB_CONNECTION_URI)
-    register_vector(conn)
-    logging.info("Successfully connected to the database and registered pgvector.")
-
-except Exception as e:
-    logging.error(f"Failed to initialize clients or connect to the database: {e}")
-    if conn:
-        conn.close()
-    exit(1)
-
-
-def get_embedding(text: str, model: str = "models/embedding-001") -> list[float]:
-    """
-    Generates a vector embedding for the given text using Gemini.
-    """
+def initialize_clients():
+    """Initialisiert Gemini API und Datenbankverbindung."""
+    global conn
+    
+    # --- Validation ---
+    if not all([GEMINI_API_KEY, DB_CONNECTION_URI]):
+        logging.error("🚨 FEHLER: Die kritischen Umgebungsvariablen GEMINI_API_KEY oder DB_CONNECTION_URI fehlen.")
+        logging.error("HINWEIS: Bitte stellen Sie sicher, dass die .env-Datei korrekt befüllt ist.")
+        sys.exit(1)
+        
+    # Prüfen, ob das Zertifikat existiert
+    if not os.path.exists(SUPABASE_CERT_PATH):
+        logging.error(f"🚨 KRITISCHER FEHLER: SSL Root Zertifikat nicht gefunden unter: {SUPABASE_CERT_PATH}")
+        logging.error("BITTE: Laden Sie die Supabase CA Root Datei herunter und speichern Sie sie als 'prod-ca-2021.crt' im Projekt-Wurzelverzeichnis.")
+        sys.exit(1)
+        
     try:
-        logging.info(f"Generating embedding for text snippet: '{text[:50]}...'")
-        result = genai.embed_content(model=model, content=text)
-        return result['embedding']
+        # 1. Gemini API global konfigurieren
+        genai.configure(api_key=GEMINI_API_KEY)
+        logging.info("✅ Gemini API erfolgreich konfiguriert.")
+        
+        # 2. PostgreSQL Verbindung (Parsen der Transaction Pooler URI)
+        parsed_uri = urlparse(DB_CONNECTION_URI)
+        
+        # Verbindung mit voller SSL-Prüfung
+        conn = psycopg2.connect(
+            host=parsed_uri.hostname,
+            port=parsed_uri.port,
+            database=parsed_uri.path.lstrip('/'),
+            user=parsed_uri.username,
+            password=parsed_uri.password,
+            # FIX: Erzwingt volle SSL-Verifizierung (Prüft Zertifikat)
+            sslmode='verify-full', 
+            sslrootcert=SUPABASE_CERT_PATH 
+        )
+        register_vector(conn)
+        logging.info("✅ Datenbankverbindung über Pooler URI mit SSL/Zertifikatprüfung hergestellt.")
+        return conn
     except Exception as e:
-        logging.error(f"Failed to generate embedding: {e}")
-        return []
+        logging.error(f"🚨 KRITISCHER FEHLER bei der Initialisierung oder Datenbankverbindung: {e}")
+        logging.error("HINWEIS: Möglicherweise liegt der Fehler noch an der 'Address not in tenant allow_list' (siehe Supabase Console und Ihre IP-Adresse dort eintragen).")
+        sys.exit(1)
 
-def store_protocol(conn, text: str, embedding: list[float], metadata: dict) -> None:
+
+# MODELL: Auf den empfohlenen Standard "text-embedding-004" umgestellt.
+def get_embedding(text: str, model: str = "text-embedding-004") -> list[float]:
     """
-    Stores the protocol text, its embedding, and metadata in the 'protokolle' table using psycopg2.
+    Generiert ein Vektor-Embedding für den gegebenen Text mit eingebauter Retry-Logik.
+    """
+    snippet = text[:60].replace('\n', ' ')
+    logging.info(f"-> Generiere Embedding für Textausschnitt: '{snippet}...'")
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = genai.embed_content( 
+                model=model,
+                content=text,
+                task_type="RETRIEVAL_DOCUMENT"
+            )
+            return response['embedding']
+        
+        except Exception as e:
+            error_message = str(e)
+            
+            if "429" in error_message or "Quota exceeded" in error_message or "Resource has been exhausted" in error_message:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logging.warning(f"⚠️ Rate Limit erreicht (429/Exhausted). Warte {wait_time}s vor Wiederholung ({attempt + 1}/{max_retries}).")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"🚨 FEHLER beim Generieren des Embeddings: Limit auch nach {max_retries} Versuchen überschritten. Tageslimit wahrscheinlich erreicht.")
+                    return [] 
+            else:
+                logging.error(f"🚨 UNBEKANNTER FEHLER beim Generieren des Embeddings: {e}")
+                return []
+            
+    return [] 
+
+def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: dict) -> None:
+    """
+    Speichert Protokolltext, Embedding und Metadaten in der 'protokolle' Tabelle.
     """
     if not embedding:
         logging.warning("Skipping storage due to empty embedding.")
         return
 
-    # Convert metadata dict to a JSON string for the JSONB column
-    metadata_json = json.dumps(metadata)
-
     try:
-        logging.info(f"Storing protocol with metadata: {metadata}")
-        # Use a `with` statement for the cursor to ensure it's closed automatically
+        metadata_json = json.dumps(metadata)
+        # FIX: pgvector benötigt eckige Klammern [] anstelle von geschweiften Klammern {}
+        embedding_str = '[' + ', '.join(map(str, embedding)) + ']'
+
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO protokolle (text, embedding, metadata) VALUES (%s, %s, %s)",
-                (text, embedding, metadata_json)
+                sql.SQL("INSERT INTO protokolle (text, embedding, metadata) VALUES (%s, %s, %s)"),
+                (protocol_text, embedding_str, metadata_json)
             )
-        # Commit the transaction to make the changes permanent
-        conn.commit()
-        logging.info(f"Successfully stored protocol for meeting_id: {metadata.get('meeting_id')}")
+            conn.commit()
+            logging.info(f"✅ Protokoll erfolgreich gespeichert. Meeting ID: {metadata.get('meeting_id')}")
+            
     except Exception as e:
-        logging.error(f"Failed to store protocol. Error: {e}")
-        # Rollback the transaction in case of an error
-        conn.rollback()
+        logging.error(f"🚨 FEHLER beim Speichern in die Datenbank: {e}")
+        logging.warning("HINWEIS: Haben Sie die 'protokolle'-Tabelle und die 'pgvector'-Extension in Supabase erstellt?")
+        conn.rollback() 
 
 
 def main():
     """
-    Main function to process and index meeting protocols.
+    Hauptfunktion zur Verarbeitung und Indexierung von Besprechungsprotokollen.
     """
-    logging.info("Starting the indexing process...")
-
-    # Sample meeting protocol data
+    logging.info("=" * 40)
+    logging.info("Protokoll Indexing Agent - Start")
+    logging.info("=" * 40)
+    
+    # Initialisiert Clients und bricht bei Fehler ab
+    conn = initialize_clients()
+    
+    # Beispiel-Daten
     meeting_protocols = [
         {
             "text": "Meeting 1: Q3 Planning. Topics discussed: budget allocation, resource management, and setting new KPIs for the marketing team. Action items assigned to John and Maria.",
@@ -106,23 +161,15 @@ def main():
     ]
 
     for protocol in meeting_protocols:
-        protocol_text = protocol["text"]
-        protocol_metadata = protocol["metadata"]
+        embedding = get_embedding(protocol["text"]) 
+        store_protocol(conn, protocol["text"], embedding, protocol["metadata"])
+        # Wartezeit von 2 Sekunden zwischen den API-Aufrufen, um Free-Tier-Limits zu respektieren.
+        time.sleep(2) 
 
-        # 1. Generate embedding
-        embedding = get_embedding(protocol_text)
-
-        # 2. Store in Supabase
-        if embedding:
-            store_protocol(conn, protocol_text, embedding, protocol_metadata)
-        else:
-            logging.warning(f"Could not process protocol {protocol_metadata['meeting_id']} due to embedding failure.")
-
-    logging.info("Indexing process completed.")
     if conn:
         conn.close()
-        logging.info("Database connection closed.")
-
+        logging.info("=" * 40)
+        logging.info("Indexing-Prozess abgeschlossen. Datenbankverbindung geschlossen.")
 
 if __name__ == "__main__":
     main()
