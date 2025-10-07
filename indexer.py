@@ -161,6 +161,8 @@ def delete_protocol(conn, source_file: str) -> None:
 def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: dict) -> None:
     """
     Speichert Protokolltext, Embedding und Metadaten in der 'protokolle' Tabelle.
+    Implementiert eine ON CONFLICT-Klausel, um doppelte Einträge basierend auf
+    der 'source_file' im Metadatenfeld zu verhindern.
     """
     if not embedding:
         logging.warning("Skipping storage due to empty embedding.")
@@ -172,17 +174,29 @@ def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: d
         embedding_str = '[' + ', '.join(map(str, embedding)) + ']'
 
         with conn.cursor() as cur:
+            # HINWEIS: Für ON CONFLICT muss ein UNIQUE Index auf (metadata->>'source_file') existieren.
+            # Beispiel: CREATE UNIQUE INDEX idx_protokolle_source_file ON protokolle ((metadata->>'source_file'));
             cur.execute(
-                sql.SQL("INSERT INTO protokolle (text, embedding, metadata) VALUES (%s, %s, %s)"),
+                sql.SQL("""
+                    INSERT INTO protokolle (text, embedding, metadata)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT ((metadata->>'source_file')) DO NOTHING
+                """),
                 (protocol_text, embedding_str, metadata_json)
             )
-            conn.commit()
-            logging.info(f"✅ Protokoll erfolgreich gespeichert. Meeting ID: {metadata.get('meeting_id')}")
             
+            # Prüfen, ob eine Zeile eingefügt wurde, um eine aussagekräftige Log-Nachricht auszugeben
+            if cur.rowcount > 0:
+                conn.commit()
+                logging.info(f"✅ Protokoll erfolgreich gespeichert. Meeting ID: {metadata.get('meeting_id')}")
+            else:
+                # Kein Commit nötig, da nichts passiert ist.
+                logging.info(f"ℹ️ Protokoll bereits indexiert. Überspringe Speicherung für Meeting ID: {metadata.get('meeting_id')}")
+
     except Exception as e:
         logging.error(f"🚨 FEHLER beim Speichern in die Datenbank: {e}")
-        logging.warning("HINWEIS: Haben Sie die 'protokolle'-Tabelle und die 'pgvector'-Extension in Supabase erstellt?")
-        conn.rollback() 
+        logging.warning("HINWEIS: Für die Idempotenz-Prüfung muss ein UNIQUE Index auf (metadata->>'source_file') in der 'protokolle'-Tabelle existieren.")
+        conn.rollback()
 
 
 def main():

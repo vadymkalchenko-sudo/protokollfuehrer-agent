@@ -26,6 +26,10 @@ DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 # NEU: Verwendet den Supabase Dateinamen, der im Dockerfile verfügbar sein muss.
 SUPABASE_CERT_PATH = os.path.join(os.path.dirname(__file__), 'prod-ca-2021.crt')
 
+# NEU (FIX): Definiert das korrekte, verfügbare Gemini-Modell für die Textgenerierung.
+# Das alte Modell 'gemini-1.5-flash' führte zu einem 404-Fehler.
+GENERATION_MODEL = 'gemini-2.5-flash-preview-05-20'
+
 SYSTEM_INSTRUCTION_PROMPT = """
 Du bist der "Protokollführer-Agent", ein hochpräziser KI-Assistent. Deine Aufgabe ist es, Fragen basierend auf den bereitgestellten Besprechungsprotokollen (Context) zu beantworten.
 Halte dich strikt an die folgenden Regeln:
@@ -138,7 +142,7 @@ def retrieve_and_generate(conn, query: str):
             )
             
             model = genai.GenerativeModel(
-                'gemini-1.5-flash', # Modellname auf eine gültige Version korrigiert
+                GENERATION_MODEL, # FIX: Verwendet die oben definierte, korrekte Modell-Variable
                 system_instruction=SYSTEM_INSTRUCTION_PROMPT
             )
             
