@@ -3,6 +3,7 @@ import logging
 import sys
 import json
 import time # Für die Wartefunktion
+import hashlib
 from dotenv import load_dotenv
 import google.generativeai as genai
 from pgvector.psycopg2 import register_vector
@@ -26,6 +27,14 @@ DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 conn = None
 # NEUER FIX: Verwendet den realistischeren Supabase Dateinamen, der oft heruntergeladen wird.
 SUPABASE_CERT_PATH = os.path.join(os.path.dirname(__file__), 'prod-ca-2021.crt')
+
+def calculate_file_hash(filepath: str) -> str:
+    """Berechnet den SHA256-Hash des Dateiinhalts und gibt ihn als Hex-String zurück."""
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        buf = f.read()
+        hasher.update(buf)
+    return hasher.hexdigest()
 
 def initialize_clients():
     """Initialisiert Gemini API und Datenbankverbindung."""
@@ -106,24 +115,68 @@ def get_embedding(text: str, model: str = "text-embedding-004") -> list[float]:
             
     return [] 
 
-def is_already_indexed(conn, source_file: str) -> bool:
-    """
-    Prüft, ob ein Protokoll mit dem gegebenen Dateinamen bereits in der DB indiziert ist.
-    """
+def load_protocol_data(filepath: str) -> dict | None:
+    """Lädt Protokolldaten aus einer Datei und erstellt Metadaten."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        filename = os.path.basename(filepath)
+        # Simple Metadaten-Extraktion aus dem Dateinamen
+        meeting_id = os.path.splitext(filename)[0]
+
+        return {
+            "text": text,
+            "metadata": {
+                "source_file": filepath,
+                "meeting_id": meeting_id
+            }
+        }
+    except Exception as e:
+        logging.error(f"Fehler beim Laden der Protokolldatei {filepath}: {e}")
+        return None
+
+def load_protocol_data(filepath: str) -> dict | None:
+    """Lädt Protokolldaten aus einer Datei und erstellt Metadaten."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        filename = os.path.basename(filepath)
+        meeting_id = os.path.splitext(filename)[0]
+
+        return {
+            "text": text,
+            "metadata": { "source_file": filepath, "meeting_id": meeting_id }
+        }
+    except Exception as e:
+        logging.error(f"Fehler beim Laden der Protokolldatei {filepath}: {e}")
+        return None
+
+def get_stored_hash(conn, source_file: str) -> str | None:
+    """Holt den gespeicherten content_hash für eine bestimmte source_file."""
     try:
         with conn.cursor() as cur:
-            # Effiziente Abfrage, die prüft, ob der 'source_file' Key im JSONB-Feld existiert und dem Wert entspricht.
+            cur.execute("SELECT metadata->>'content_hash' FROM protokolle WHERE metadata->>'source_file' = %s", (source_file,))
+            result = cur.fetchone()
+            return result[0] if result else None
+    except Exception as e:
+        logging.error(f"🚨 FEHLER beim Abrufen des Hashes für '{source_file}': {e}")
+        return None
+
+def delete_protocol(conn, source_file: str) -> None:
+    """Löscht einen Protokolleintrag basierend auf der source_file."""
+    try:
+        with conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM protokolle WHERE metadata->>'source_file' = %s LIMIT 1",
+                "DELETE FROM protokolle WHERE metadata->>'source_file' = %s",
                 (source_file,)
             )
-            # fetchone() gibt ein Tupel zurück, wenn ein Datensatz gefunden wird, sonst None.
-            return cur.fetchone() is not None
+            conn.commit()
+            logging.info(f"🗑️ Alten Eintrag für '{source_file}' gelöscht.")
     except Exception as e:
-        logging.error(f"🚨 FEHLER bei der Duplikatsprüfung für '{source_file}': {e}")
-        # Im Fehlerfall gehen wir vorsichtshalber davon aus, dass es nicht indiziert ist,
-        # um Datenverlust zu vermeiden, aber loggen den Fehler deutlich.
-        return False
+        logging.error(f"🚨 FEHLER beim Löschen des alten Eintrags für '{source_file}': {e}")
+        conn.rollback()
 
 def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: dict) -> None:
     """
@@ -154,7 +207,7 @@ def store_protocol(conn, protocol_text: str, embedding: list[float], metadata: d
 
 def main():
     """
-    Hauptfunktion zur Verarbeitung und Indexierung von Besprechungsprotokollen.
+    Hauptfunktion zur Verarbeitung und Indexierung von Besprechungsprotokollen aus einem Verzeichnis.
     """
     logging.info("=" * 40)
     logging.info("Protokoll Indexing Agent - Start")
@@ -163,40 +216,42 @@ def main():
     # Initialisiert Clients und bricht bei Fehler ab
     conn = initialize_clients()
     
-    # Beispiel-Daten (angepasst, um 'source_file' zu enthalten)
-    # In einer echten Implementierung würde dies aus dem Dateisystem geladen.
-    meeting_protocols = [
-        {
-            "text": "Meeting 1: Q3 Planning. Topics discussed: budget allocation, resource management, and setting new KPIs for the marketing team. Action items assigned to John and Maria.",
-            "metadata": {"date": "2024-07-15", "meeting_id": "M1", "department": "Marketing", "source_file": "protocols/meeting_q3_planning.txt"}
-        },
-        {
-            "text": "Meeting 2: Technical Sprint Review. The engineering team presented the new features for the mobile app. A bug was identified in the payment gateway integration. The bug was assigned to the backend team.",
-            "metadata": {"date": "2024-07-16", "meeting_id": "M2", "department": "Engineering", "source_file": "protocols/sprint_review_tech.md"}
-        },
-        {
-            "text": "Meeting 3: All-Hands Update. CEO shared the company's performance for H1 2024. New strategic partnerships were announced. An open Q&A session was held.",
-            "metadata": {"date": "2024-07-18", "meeting_id": "M3", "department": "All", "source_file": "protocols/all_hands_h1_2024.txt"}
-        }
-    ]
+    protocols_dir = "protocols"
+    if not os.path.isdir(protocols_dir):
+        logging.error(f"Fehler: Das Verzeichnis '{protocols_dir}' wurde nicht gefunden.")
+        sys.exit(1)
 
-    for protocol in meeting_protocols:
-        # Extrahiere den Dateinamen für die Duplikatsprüfung
-        source_file = protocol["metadata"].get("source_file")
+    protocol_files = [os.path.join(protocols_dir, f) for f in os.listdir(protocols_dir) if os.path.isfile(os.path.join(protocols_dir, f))]
 
-        if not source_file:
-            logging.warning(f"Skipping protocol due to missing 'source_file' in metadata: {protocol['metadata']}")
+    for filepath in protocol_files:
+        protocol_data = load_protocol_data(filepath)
+        if not protocol_data:
             continue
 
-        # Prüfen, ob die Datei bereits indiziert wurde
-        if is_already_indexed(conn, source_file):
-            logging.info(f"Skipping {source_file}: Already indexed.")
-            continue # Nächste Datei verarbeiten
+        source_file = protocol_data["metadata"]["source_file"]
+        protocol_text = protocol_data["text"]
 
-        # Nur wenn nicht bereits indiziert, Embedding holen und speichern
-        logging.info(f"Processing new file: {source_file}")
-        embedding = get_embedding(protocol["text"]) 
-        store_protocol(conn, protocol["text"], embedding, protocol["metadata"])
+        # 1. Aktuellen Hash berechnen
+        current_hash = calculate_file_hash(filepath)
+        protocol_data["metadata"]["content_hash"] = current_hash
+
+        # 2. Gespeicherten Hash aus der DB holen
+        stored_hash = get_stored_hash(conn, source_file)
+
+        # 3. Logik zur (Neu-)Indizierung
+        if stored_hash == current_hash:
+            logging.info(f"Skipping '{source_file}': Content is unchanged (Hash match).")
+            continue
+
+        if stored_hash is not None:
+            logging.info(f"Content of '{source_file}' has changed. Deleting old entry and re-indexing...")
+            delete_protocol(conn, source_file)
+        else:
+            logging.info(f"Processing new file: {source_file}")
+
+        # 4. Embedding holen und speichern
+        embedding = get_embedding(protocol_text)
+        store_protocol(conn, protocol_text, embedding, protocol_data["metadata"])
 
         # Wartezeit von 2 Sekunden zwischen den API-Aufrufen, um Free-Tier-Limits zu respektieren.
         time.sleep(2) 

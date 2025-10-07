@@ -26,6 +26,14 @@ DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
 # NEU: Verwendet den Supabase Dateinamen, der im Dockerfile verfügbar sein muss.
 SUPABASE_CERT_PATH = os.path.join(os.path.dirname(__file__), 'prod-ca-2021.crt')
 
+SYSTEM_INSTRUCTION_PROMPT = """
+Du bist der "Protokollführer-Agent", ein hochpräziser KI-Assistent. Deine Aufgabe ist es, Fragen basierend auf den bereitgestellten Besprechungsprotokollen (Context) zu beantworten.
+Halte dich strikt an die folgenden Regeln:
+1.  Antworte ausschließlich basierend auf dem bereitgestellten Kontext. Wenn die Information fehlt, antworte: "Diese Information konnte in den indizierten Protokollen nicht gefunden werden."
+2.  Formuliere Deine Antworten immer in kurzen, präzisen Sätzen (maximal 3 Sätze pro Punkt).
+3.  Fasse die Hauptpunkte in einer klaren, nummerierten Liste zusammen, falls mehrere Informationen gefunden wurden.
+"""
+
 def initialize_clients():
     """Initialisiert Gemini API und Datenbankverbindung."""
     
@@ -123,12 +131,6 @@ def retrieve_and_generate(conn, query: str):
             logging.info(f"✅ {len(results)} Dokumente für RAG gefunden und Kontext vorbereitet.")
 
             # 4. Antwort generieren
-            system_instruction = (
-                "Du bist ein Protokoll-Experte und KI-Assistent. Deine Aufgabe ist es, "
-                "die Benutzerfrage präzise und freundlich zu beantworten, basierend ausschließlich auf dem bereitgestellten Kontext. "
-                "Wenn die Antwort nicht im Kontext enthalten ist, sage höflich, dass du die Informationen nicht finden konntest."
-            )
-            
             prompt = (
                 f"Antworte auf die Frage des Benutzers basierend auf dem folgenden Kontext:\n\n"
                 f"KONTEXT:\n{context}\n\n"
@@ -136,8 +138,8 @@ def retrieve_and_generate(conn, query: str):
             )
             
             model = genai.GenerativeModel(
-                'gemini-2.5-flash', # FIX: Modellname als Positionsargument übergeben, nicht als Schlüsselwortargument 'model='
-                system_instruction=system_instruction
+                'gemini-1.5-flash', # Modellname auf eine gültige Version korrigiert
+                system_instruction=SYSTEM_INSTRUCTION_PROMPT
             )
             
             response = model.generate_content(prompt)
