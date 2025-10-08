@@ -10,3 +10,6 @@ python-dotenv
 # Vector database
 psycopg2-binary
 pgvector
+
+# Coloring
+colorama
