@@ -98,10 +98,17 @@ async def embed_and_store_text(conn: asyncpg.Connection, text: str, source: str)
         return False
 
 # --- RAG Query Operations ---
-async def find_similar_texts(conn: asyncpg.Connection, question: str) -> Optional[str]:
-    """Finds texts in the database similar to the user's question."""
-    logging.info(f"{Fore.CYAN}Generating embedding for the question...")
+async def handle_query_input(conn: asyncpg.Connection):
+    """Handles the entire RAG cycle from user input to final answer."""
+    # 1. Benutzer-Eingabe
+    question = input(Fore.WHITE + "Stellen Sie Ihre Frage: ")
+    if not question.strip():
+        logging.warning("Leere Frage eingegeben. Vorgang abgebrochen.")
+        return
+
     try:
+        # 2. Query-Embedding
+        logging.info("Generiere Vektor-Embedding für die Frage...")
         embedding_model = "text-embedding-004"
         embedding_response = await asyncio.to_thread(
             genai.embed_content,
@@ -109,53 +116,76 @@ async def find_similar_texts(conn: asyncpg.Connection, question: str) -> Optiona
             content=question,
             task_type="RETRIEVAL_QUERY"
         )
-        embedding = embedding_response['embedding']
+        query_embedding = embedding_response['embedding']
 
-        logging.info(f"{Fore.CYAN}Searching for relevant context in the database...")
-        # Using cosine distance (1 - cosine_similarity) with the <=> operator
-        records = await conn.fetch(
-            "SELECT text FROM protokolle ORDER BY embedding <=> $1 LIMIT 5",
-            embedding
+        # 3. Datenbank-Retrieval (Vektor-Suche)
+        logging.info("Suche nach relevanten Dokumenten in der Datenbank...")
+        # Die Cosinus-Distanz ist 1 - Cosinus-Ähnlichkeit. Wir wollen die Ähnlichkeit.
+        # Top-K=3
+        retrieved_records = await conn.fetch(
+            """
+            SELECT
+                text,
+                metadata->>'source' AS source,
+                1 - (embedding <=> $1) AS similarity
+            FROM protokolle
+            ORDER BY embedding <=> $1
+            LIMIT 3
+            """,
+            query_embedding
         )
 
-        if not records:
-            logging.warning(f"{Fore.YELLOW}No relevant information found in the database.")
-            return None
+        if not retrieved_records:
+            logging.warning("Keine relevanten Dokumente im Vektor-Index gefunden.")
+            print(Fore.YELLOW + "Ich konnte keine relevanten Informationen zu Ihrer Frage finden.")
+            return
 
-        context = "\n---\n".join([rec['text'] for rec in records])
-        return context
-    except Exception as e:
-        logging.error(f"{Fore.RED}🚨 An error occurred during similarity search: {e}")
-        return None
+        # 4. Kontext-Erstellung
+        logging.info(f"{len(retrieved_records)} relevante Dokumente gefunden. Erstelle Kontext...")
+        context_parts = []
+        for rec in retrieved_records:
+            source = rec['source'] or 'Unbekannt'
+            similarity = rec['similarity']
+            text = rec['text']
+            context_part = (
+                f"Quelle: {source}, Ähnlichkeit: {similarity:.4f}\n"
+                f"---\n"
+                f"{text}"
+            )
+            context_parts.append(context_part)
 
-async def ask_question_with_context(question: str, context: str) -> None:
-    """Asks the generative model a question based on the provided context."""
-    logging.info(f"{Fore.CYAN}Asking the Gemini model for an answer...")
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash-preview-0514')
+        context = "\n\n".join(context_parts)
 
-        system_instruction = (
-            "You are a helpful assistant. Your name is 'Protokollführer-Agent'. "
-            "Answer the user's question based *only* on the provided context. "
-            "If the answer is not found in the context, say 'I cannot answer this question based on the provided information.' "
-            "Do not use any external knowledge. Be concise and precise."
+        # 5. Gemini-Generierung
+        logging.info("Generiere finale Antwort mit dem Gemini-Modell...")
+        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        system_prompt = (
+            "Du bist ein spezialisierter Assistent für Protokoll-Analyse. "
+            "Deine Aufgabe ist es, die folgende Frage prägnant und ausschließlich basierend auf dem bereitgestellten Kontext zu beantworten. "
+            "Fasse die relevanten Informationen zusammen. Gib ehrlich zu, wenn die Antwort nicht im Kontext enthalten ist. "
+            "Verwende keine externen Wissensquellen."
         )
 
-        # The 'system_instruction' parameter is not directly supported in all versions/methods.
-        # Prepending it to the user prompt is a common and reliable workaround.
-        prompt = f"{system_instruction}\n\nContext:\n{context}\n\nQuestion: {question}"
+        final_prompt = f"{system_prompt}\n\nKONTEXT:\n{context}\n\nFRAGE:\n{question}"
 
         response = await asyncio.to_thread(
             model.generate_content,
-            prompt
+            final_prompt
         )
 
-        print(Fore.MAGENTA + "\n--- Antwort des Agenten ---")
+        # 6. Output
+        print(Fore.GREEN + "\n=== ANTWORT ===")
         print(Style.BRIGHT + response.text)
-        print(Fore.MAGENTA + "--------------------------\n")
+        print(Fore.GREEN + "===============\n")
 
     except Exception as e:
-        logging.error(f"{Fore.RED}🚨 An error occurred while communicating with the Gemini API: {e}")
+        # 6. Fehlerbehandlung
+        logging.error(f"Ein Fehler ist während der Abfrageverarbeitung aufgetreten: {e}", exc_info=True)
+        # asyncpg's connection objects don't have a rollback method.
+        # Transactions are managed via Transaction objects. For a single query, this is not needed.
+        # We'll log the error and inform the user.
+        print(Fore.RED + "Es ist ein Fehler aufgetreten. Bitte überprüfen Sie die Logs.")
 
 # --- Main Application Loop ---
 def print_menu():
@@ -199,14 +229,7 @@ async def main():
                     logging.warning(f"{Fore.YELLOW}Kein Text eingegeben.")
 
             elif choice == '2':
-                question = input(Fore.WHITE + "Stellen Sie Ihre Frage: ")
-                if not question:
-                    logging.warning(f"{Fore.YELLOW}Keine Frage eingegeben.")
-                    continue
-
-                context = await find_similar_texts(conn, question)
-                if context:
-                    await ask_question_with_context(question, context)
+                await handle_query_input(conn)
 
             elif choice == '3':
                 print(Fore.GREEN + "Anwendung wird beendet. Auf Wiedersehen!")
