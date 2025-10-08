@@ -1,13 +1,11 @@
 # Gemini
 google-generativeai
 
-# Supabase
-supabase
-
 # Environment variables
 python-dotenv
 
 # Vector database
+asyncpg
 psycopg2-binary
 pgvector
 

@@ -1,76 +1,66 @@
 import asyncio
+import logging
 import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
+import asyncpg
 import google.generativeai as genai
 from colorama import Fore, Style, init
 from dotenv import load_dotenv
-from pgvector.psycopg2 import register_vector
-from supabase import Client, create_client
+from pgvector.asyncpg import register_vector
 
 # --- Initialization ---
 init(autoreset=True)
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Environment Variable and Client Setup ---
-def get_env_variable(var_name: str) -> str:
-    """Gets an environment variable or exits if not found."""
-    value = os.getenv(var_name)
-    if not value:
-        print(Fore.RED + f"Error: Environment variable '{var_name}' not found.")
-        print(Fore.YELLOW + "Please create a .env file with the required variables.")
+# --- Environment Variable Setup ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DB_CONNECTION_URI = os.getenv("DB_CONNECTION_URI")
+
+def check_env_variables():
+    """Checks for necessary environment variables and exits if they are missing."""
+    if not GEMINI_API_KEY or not DB_CONNECTION_URI:
+        logging.error(f"{Fore.RED}🚨 Critical environment variables (DB_CONNECTION_URI or GEMINI_API_KEY) are missing. Please create a .env file or set them. Program terminated.")
         sys.exit(1)
-    return value
-
-def create_supabase_client() -> Client:
-    """Creates and returns a Supabase client."""
-    supabase_url = get_env_variable("SUPABASE_URI")
-    supabase_key = get_env_variable("SUPABASE_KEY")
-    return create_client(supabase_url, supabase_key)
-
-def configure_gemini_api():
-    """Configures the Gemini API."""
-    api_key = get_env_variable("GEMINI_API_KEY")
-    genai.configure(api_key=api_key)
+    genai.configure(api_key=GEMINI_API_KEY)
+    logging.info(f"{Fore.GREEN}Environment variables loaded successfully.")
 
 # --- Database Operations ---
-async def ensure_table_and_extension(supabase: Client):
-    """Ensures the pgvector extension is enabled and the table exists."""
-    # The Supabase client v2 uses psycopg2 under the hood, which is synchronous.
-    # We'll wrap synchronous calls in asyncio.to_thread to avoid blocking.
-    def sync_db_setup():
-        with supabase.postgrest.session as session:
-            # The python client doesn't have a generic RPC call for this,
-            # so we assume the extension is enabled in the Supabase dashboard.
-            # A more robust solution would use a direct psycopg2 connection.
-            print(Fore.CYAN + "Checking for 'protokolle' table...")
+async def get_db_connection() -> asyncpg.Connection:
+    """Establishes a database connection using the connection URI."""
+    try:
+        conn = await asyncpg.connect(DB_CONNECTION_URI)
+        await register_vector(conn)
+        logging.info(f"{Fore.GREEN}Database connection established successfully.")
+        return conn
+    except Exception as e:
+        logging.error(f"{Fore.RED}🚨 Could not connect to the database: {e}")
+        sys.exit(1)
 
-            # Check if table exists
-            response = supabase.table("protokolle").select("id").limit(1).execute()
+async def ensure_schema(conn: asyncpg.Connection):
+    """Ensures the pgvector extension is enabled and the 'protokolle' table exists."""
+    try:
+        logging.info(f"{Fore.CYAN}Ensuring database schema exists...")
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS protokolle (
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                embedding VECTOR(768),
+                metadata JSONB,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        logging.info(f"{Fore.GREEN}Database schema verified and ready.")
+    except Exception as e:
+        logging.error(f"{Fore.RED}🚨 Error ensuring database schema: {e}")
+        sys.exit(1)
 
-            # PostgREST returns an error if the table doesn't exist.
-            # We can't easily check for a "table does not exist" error code here.
-            # A simple approach is to try to create it and let it fail if it exists.
-            # This is not ideal but works for this CLI tool.
-            try:
-                # Create table schema if it doesn't exist
-                # This is a placeholder, as direct DDL from the client is not standard.
-                # It's better to set up the table via the Supabase SQL Editor.
-                # The following is a conceptual representation.
-                # A real implementation would use rpc() to call a stored procedure.
-                pass # Assuming table is created via Supabase UI
-            except Exception as e:
-                # This will likely fail, but we proceed assuming the table exists.
-                pass
-        print(Fore.GREEN + "Database ready (assuming 'protokolle' table and 'pgvector' extension exist).")
-
-    await asyncio.to_thread(sync_db_setup)
-
-
-async def embed_and_store_text(supabase: Client, text: str, source: str) -> bool:
+async def embed_and_store_text(conn: asyncpg.Connection, text: str, source: str) -> bool:
     """Generates embedding for text and stores it in the database."""
-    print(Fore.CYAN + f"Generating embedding for source: {source}...")
+    logging.info(f"{Fore.CYAN}Generating embedding for source: {source}...")
     try:
         embedding_model = "text-embedding-004"
         embedding_response = await asyncio.to_thread(
@@ -81,23 +71,23 @@ async def embed_and_store_text(supabase: Client, text: str, source: str) -> bool
         )
         embedding = embedding_response['embedding']
 
-        print(Fore.CYAN + "Storing text and embedding in the database...")
-        data = {
-            "text": text,
-            "embedding": embedding,
-            "metadata": {"source": source}
-        }
-        await asyncio.to_thread(supabase.table("protokolle").insert(data).execute)
-        print(Fore.GREEN + "Successfully stored the manifest.")
+        logging.info(f"{Fore.CYAN}Storing text and embedding in the database...")
+        await conn.execute(
+            "INSERT INTO protokolle (text, embedding, metadata) VALUES ($1, $2, $3)",
+            text,
+            embedding,
+            {'source': source}
+        )
+        logging.info(f"{Fore.GREEN}Successfully stored the manifest from source: {source}")
         return True
     except Exception as e:
-        print(Fore.RED + f"An error occurred during embedding or storage: {e}")
+        logging.error(f"{Fore.RED}🚨 An error occurred during embedding or storage: {e}")
         return False
 
 # --- RAG Query Operations ---
-async def find_similar_texts(supabase: Client, question: str) -> Optional[str]:
+async def find_similar_texts(conn: asyncpg.Connection, question: str) -> Optional[str]:
     """Finds texts in the database similar to the user's question."""
-    print(Fore.CYAN + "Generating embedding for the question...")
+    logging.info(f"{Fore.CYAN}Generating embedding for the question...")
     try:
         embedding_model = "text-embedding-004"
         embedding_response = await asyncio.to_thread(
@@ -108,32 +98,26 @@ async def find_similar_texts(supabase: Client, question: str) -> Optional[str]:
         )
         embedding = embedding_response['embedding']
 
-        print(Fore.CYAN + "Searching for relevant context in the database...")
-        # Use rpc to call the match_documents function
-        match_response = await asyncio.to_thread(
-            supabase.rpc,
-            'match_protokolle',
-            {
-                'query_embedding': embedding,
-                'match_threshold': 0.75,
-                'match_count': 5
-            }
+        logging.info(f"{Fore.CYAN}Searching for relevant context in the database...")
+        # Using cosine distance (1 - cosine_similarity) with the <=> operator
+        records = await conn.fetch(
+            "SELECT text FROM protokolle ORDER BY embedding <=> $1 LIMIT 5",
+            embedding
         )
 
-        if not match_response.data:
-            print(Fore.YELLOW + "No relevant information found in the database.")
+        if not records:
+            logging.warning(f"{Fore.YELLOW}No relevant information found in the database.")
             return None
 
-        # Combine the texts to form the context
-        context = "\n---\n".join([item['text'] for item in match_response.data])
+        context = "\n---\n".join([rec['text'] for rec in records])
         return context
     except Exception as e:
-        print(Fore.RED + f"An error occurred during similarity search: {e}")
+        logging.error(f"{Fore.RED}🚨 An error occurred during similarity search: {e}")
         return None
 
 async def ask_question_with_context(question: str, context: str) -> None:
     """Asks the generative model a question based on the provided context."""
-    print(Fore.CYAN + "Asking the Gemini model for an answer...")
+    logging.info(f"{Fore.CYAN}Asking the Gemini model for an answer...")
     try:
         model = genai.GenerativeModel('gemini-1.5-flash-preview-0514')
 
@@ -144,10 +128,13 @@ async def ask_question_with_context(question: str, context: str) -> None:
             "Do not use any external knowledge. Be concise and precise."
         )
 
+        # The 'system_instruction' parameter is not directly supported in all versions/methods.
+        # Prepending it to the user prompt is a common and reliable workaround.
+        prompt = f"{system_instruction}\n\nContext:\n{context}\n\nQuestion: {question}"
+
         response = await asyncio.to_thread(
             model.generate_content,
-            f"Context:\n{context}\n\nQuestion: {question}",
-            # generation_config={"system_instruction": system_instruction} # Not supported in all versions
+            prompt
         )
 
         print(Fore.MAGENTA + "\n--- Antwort des Agenten ---")
@@ -155,8 +142,7 @@ async def ask_question_with_context(question: str, context: str) -> None:
         print(Fore.MAGENTA + "--------------------------\n")
 
     except Exception as e:
-        print(Fore.RED + f"An error occurred while communicating with the Gemini API: {e}")
-
+        logging.error(f"{Fore.RED}🚨 An error occurred while communicating with the Gemini API: {e}")
 
 # --- Main Application Loop ---
 def print_menu():
@@ -169,55 +155,62 @@ def print_menu():
 
 async def main():
     """The main function to run the CLI."""
-    # --- Setup ---
-    configure_gemini_api()
-    supabase = create_supabase_client()
-    await ensure_table_and_extension(supabase)
+    check_env_variables()
+    conn = await get_db_connection()
+    await ensure_schema(conn)
 
-    # --- Main Loop ---
-    while True:
-        print_menu()
-        choice = input(Fore.WHITE + "Wähle eine Option: ")
+    try:
+        while True:
+            print_menu()
+            choice = input(Fore.WHITE + "Wähle eine Option: ")
 
-        if choice == '1':
-            print(Fore.CYAN + "Geben Sie den Text des Manifests ein. Geben Sie 'ENDE' in eine neue Zeile ein, um zu beenden.")
-            manifest_text = []
-            while True:
-                line = input()
-                if line == 'ENDE':
-                    break
-                manifest_text.append(line)
+            if choice == '1':
+                print(Fore.CYAN + "Geben Sie den Text des Manifests ein. Geben Sie 'ENDE' in eine neue Zeile ein, um zu beenden.")
+                manifest_text = []
+                while True:
+                    try:
+                        line = input()
+                        if line.strip().upper() == 'ENDE':
+                            break
+                        manifest_text.append(line)
+                    except EOFError:
+                        break
 
-            if manifest_text:
-                full_text = "\n".join(manifest_text)
-                source_name = input(Fore.WHITE + "Geben Sie einen Quellnamen für dieses Manifest an (z.B. 'Meeting-2024-10-08'): ")
-                await embed_and_store_text(supabase, full_text, source_name)
+                if manifest_text:
+                    full_text = "\n".join(manifest_text)
+                    source_name = input(Fore.WHITE + "Geben Sie einen Quellnamen für dieses Manifest an (z.B. 'Meeting-2024-10-08'): ")
+                    if not source_name:
+                        source_name = "manual_input"
+                    await embed_and_store_text(conn, full_text, source_name)
+                else:
+                    logging.warning(f"{Fore.YELLOW}Kein Text eingegeben.")
+
+            elif choice == '2':
+                question = input(Fore.WHITE + "Stellen Sie Ihre Frage: ")
+                if not question:
+                    logging.warning(f"{Fore.YELLOW}Keine Frage eingegeben.")
+                    continue
+
+                context = await find_similar_texts(conn, question)
+                if context:
+                    await ask_question_with_context(question, context)
+
+            elif choice == '3':
+                print(Fore.GREEN + "Anwendung wird beendet. Auf Wiedersehen!")
+                break
+
             else:
-                print(Fore.YELLOW + "Kein Text eingegeben.")
-
-        elif choice == '2':
-            question = input(Fore.WHITE + "Stellen Sie Ihre Frage: ")
-            if not question:
-                print(Fore.YELLOW + "Keine Frage eingegeben.")
-                continue
-
-            context = await find_similar_texts(supabase, question)
-            if context:
-                await ask_question_with_context(question, context)
-
-        elif choice == '3':
-            print(Fore.GREEN + "Anwendung wird beendet. Auf Wiedersehen!")
-            break
-
-        else:
-            print(Fore.RED + "Ungültige Auswahl. Bitte versuchen Sie es erneut.")
+                logging.warning(f"{Fore.RED}Ungültige Auswahl. Bitte versuchen Sie es erneut.")
+    finally:
+        await conn.close()
+        logging.info(f"{Fore.GREEN}Database connection closed.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(Fore.GREEN + "\nAnwendung wird beendet.")
+        print(Fore.GREEN + "\nAnwendung wird durch Benutzer beendet.")
         sys.exit(0)
     except Exception as e:
-        print(Fore.RED + f"\nEin unerwarteter Fehler ist aufgetreten: {e}")
+        logging.error(f"{Fore.RED}\nEin unerwarteter Fehler ist aufgetreten: {e}")
         sys.exit(1)
