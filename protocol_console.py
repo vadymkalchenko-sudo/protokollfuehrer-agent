@@ -12,7 +12,12 @@ from pgvector.asyncpg import register_vector
 
 # --- Initialization ---
 init(autoreset=True)
-load_dotenv()
+# Load environment variables
+# 1. Lade die öffentliche Vorlage (.env)
+load_dotenv(".env")
+# 2. Lade die lokale, private Schlüssel-Datei (.env.local).
+#    Diese MUSS die Werte in der .env ueberschreiben.
+load_dotenv(".env.local", override=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Environment Variable Setup ---
