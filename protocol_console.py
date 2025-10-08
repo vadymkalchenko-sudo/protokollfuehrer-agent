@@ -9,6 +9,7 @@ import google.generativeai as genai
 from colorama import Fore, Style, init
 from dotenv import load_dotenv
 from pgvector.asyncpg import register_vector
+import json
 
 # --- Initialization ---
 init(autoreset=True)
@@ -75,13 +76,20 @@ async def embed_and_store_text(conn: asyncpg.Connection, text: str, source: str)
             task_type="RETRIEVAL_DOCUMENT"
         )
         embedding = embedding_response['embedding']
+        metadata = {'source': source}
+
+        # KRITISCHER FIX: Konvertiert das Python Dictionary in einen JSON-String,
+        # da die Datenbank (jsonb) einen String erwartet.
+        metadata_json = json.dumps(metadata)
 
         logging.info(f"{Fore.CYAN}Storing text and embedding in the database...")
+        # The `register_vector` call for asyncpg handles the list-to-vector conversion,
+        # so explicit string formatting of the embedding is not needed.
         await conn.execute(
             "INSERT INTO protokolle (text, embedding, metadata) VALUES ($1, $2, $3)",
             text,
             embedding,
-            {'source': source}
+            metadata_json
         )
         logging.info(f"{Fore.GREEN}Successfully stored the manifest from source: {source}")
         return True
