@@ -19,9 +19,9 @@ ENV PYTHONPATH=$PYTHON_DEPENDENCIES_PATH
 # Erstelle das Verzeichnis für die Abhängigkeiten
 RUN mkdir -p $PYTHON_DEPENDENCIES_PATH
 
-# Installiere PostgreSQL client development files needed for psycopg2
-# Aktualisiert die Repositories und installiert libpq-dev
-RUN apt-get update && apt-get install -y libpq-dev && rm -rf /var/lib/apt/lists/*
+# Installiere PostgreSQL client development files needed for psycopg2 and Tkinter
+# Aktualisiert die Repositories und installiert libpq-dev und python3-tk
+RUN apt-get update && apt-get install -y libpq-dev python3-tk && rm -rf /var/lib/apt/lists/*
 
 # Kopiere die Abhängigkeitsdatei in das Arbeitsverzeichnis
 COPY requirements.txt .

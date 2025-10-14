@@ -11,4 +11,4 @@ services:
       - ./protocols:/app/protocols
     stdin_open: true
     tty: true
-    command: python protocol_console.py
+    command: python main.py
