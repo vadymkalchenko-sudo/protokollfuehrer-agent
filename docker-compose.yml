@@ -7,11 +7,13 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    # NEU: DISPLAY wird explizit auf den Host-Resolver gesetzt
     environment:
-      - DISPLAY=${DISPLAY}
+      - DISPLAY=host.docker.internal:0
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Nur dieser Volume-Mount bleibt übrig:
       - ./protocols:/app/protocols
+    # Stellt sicher, dass host.docker.internal zur Host-IP aufgelöst wird
     extra_hosts:
       - "host.docker.internal:host-gateway"
     stdin_open: true
