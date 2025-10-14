@@ -7,8 +7,12 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
-    # NEU: 'environment:' wurde entfernt, um WSLg die automatische Zuweisung zu erlauben.
+    # NEU: DISPLAY wird vom WSLg-Host in den Container injiziert (Shell-Wert wird übernommen)
+    environment:
+      - DISPLAY
     volumes:
+      # Mount für den X11-Socket (wird von WSLg/X11 genutzt)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ./protocols:/app/protocols
     extra_hosts:
       - "host.docker.internal:host-gateway"
